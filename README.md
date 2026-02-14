@@ -1,6 +1,6 @@
 # x320-stm-usb
 adding ability to stream evt data from  GENX320 sensor on stm32 board to host over usb
-
+Usage:
 Use .ioc configuration file in Prophesee's demo source code for the stm32 discovery kit.
 Open the .ioc with CubeMX, and in pins & configuration set USB_OTG_FS to device_only. Disable usart1 to enable vbus sensing for USB_OTG_FS.
 Go to clocking tab, auto resolve clocks to achieve 48 MHz USB. This will interfere with ToughGFX on the LCD display, but you will still be able to see the event stream visualized.
