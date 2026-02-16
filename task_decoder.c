@@ -33,37 +33,17 @@
 #define COLOR_ON  				(1)
 #define COLOR_OFF 				(2)
 
-//usb streaming
-#include "usbd_cdc_if.h"   // CDC_Transmit_FS
+//usb streaming definitions
+#include "usbd_cdc_if.h"   // for CDC_Transmit_FS (this is method for usb transfer)
 #include "cmsis_os2.h"
 
-#define USB_TX_BUF_SZ (64 * 1024)
+#define USB_TX_BUF_SZ (64 * 1024)  //note: try larger?
 
-static uint8_t usb_tx_rb[USB_TX_BUF_SZ];
-static volatile uint32_t usb_w = 0, usb_r = 0;
-static volatile uint32_t usb_drop_bytes = 0;
+static uint8_t usb_tx_rb[USB_TX_BUF_SZ]; //usb transfer ringbuffer
+static volatile uint32_t usb_w = 0, usb_r = 0; //read and write addresses for rb above
+static volatile uint32_t usb_drop_bytes = 0; //for debug
 
-static inline void usb_rb_push_bytes(const uint8_t *p, uint32_t n)
-{
-    while (n--) {
-        uint32_t next = (usb_w + 1) % USB_TX_BUF_SZ;
-        if (next == usb_r) { usb_drop_bytes++; return; } // full -> drop (don't block)
-        usb_tx_rb[usb_w] = *p++;
-        usb_w = next;
-    }
-}
-
-static inline uint32_t usb_rb_pop_bytes(uint8_t *out, uint32_t maxn)
-{
-    uint32_t n = 0;
-    while (usb_r != usb_w && n < maxn) {
-        out[n++] = usb_tx_rb[usb_r];
-        usb_r = (usb_r + 1) % USB_TX_BUF_SZ;
-    }
-    return n;
-}
-
-//end usb streaming
+//end usb streaming definitions
 
 /* Statistics Variables */
 volatile uint32_t evt_statistics[2] = {0};
@@ -82,6 +62,62 @@ uint32_t nbev_rate = 0;
 uint32_t ev_processed = 0;
 uint32_t calib_done = 0;
 
+//usb transfer functions
+//using a transfer ring buffer, functions to push and pop only full evt2 word
+//policy for full buffer is drop incoming
+static inline void usb_rb_push_bytes(const uint8_t *p, uint32_t n) //for debug, do NOT use for actual evt2 trasnfer, misalignment
+{
+    while (n--) {
+        uint32_t next = (usb_w + 1) % USB_TX_BUF_SZ;
+        if (next == usb_r) { usb_drop_bytes++; return; } // if its full then just drop
+        usb_tx_rb[usb_w] = *p++;
+        usb_w = next;
+    }
+}
+static inline uint32_t usb_rb_used_bytes(void)
+{
+    if (usb_w >= usb_r) return usb_w - usb_r;
+    return USB_TX_BUF_SZ - (usb_r - usb_w);
+}
+
+static inline uint32_t usb_rb_free_bytes(void)
+{
+    // one byte is kept empty to for full vs empty
+    return (USB_TX_BUF_SZ - 1) - usb_rb_used_bytes();
+}
+static inline uint32_t usb_rb_pop_bytes(uint8_t *out, uint32_t maxn)
+{
+	uint32_t avail = usb_rb_used_bytes();
+	uint32_t n = (avail < maxn) ? avail : maxn;
+
+	n &= ~3u; // multiple of 4 aka only valid evt2 word sizes
+
+	uint32_t i = 0;
+	while (i < n) {
+		out[i++] = usb_tx_rb[usb_r];
+		usb_r = (usb_r + 1) % USB_TX_BUF_SZ;
+	}
+	return n;
+}
+
+static inline int usb_rb_push_u32(uint32_t w)
+{
+    if (usb_rb_free_bytes() < 4) {
+        usb_drop_bytes += 4;   // drop full word if cant fit
+        return 0;
+    }
+
+    const uint8_t *p = (const uint8_t *)&w;
+    // write 4 bytes
+    for (int i = 0; i < 4; i++) {
+        usb_tx_rb[usb_w] = p[i];
+        usb_w = (usb_w + 1) % USB_TX_BUF_SZ;
+    }
+    return 1;
+}
+
+
+//
 /**
  * @brief Function to disable Hot pixels
  * @param histogram Pointer to the histogram buffer
@@ -245,7 +281,8 @@ void task_evt_decoder(const args_evt_decoder_t *args) {
 		if(dma_read_idx > dma_idx) {
 			while (dma_read_idx < TX_SIZE) {
 				uint32_t word = event_buffer[dma_read_idx++];
-				usb_rb_push_bytes((uint8_t*)&word, 4);  // tap raw EVT2 word
+				//usb_rb_push_bytes((uint8_t*)&word, 4);  // tap raw EVT2 word
+				usb_rb_push_u32(word);
 				decode_evt2(word);
 			}
 			dma_read_idx = 0;
@@ -253,7 +290,8 @@ void task_evt_decoder(const args_evt_decoder_t *args) {
 
 		while (dma_read_idx < dma_idx) {
 			uint32_t word = event_buffer[dma_read_idx++];
-			usb_rb_push_bytes((uint8_t*)&word, 4);  // tap raw EVT2 word
+			//usb_rb_push_bytes((uint8_t*)&word, 4);  // tap raw EVT2 word
+			usb_rb_push_u32(word);
 			decode_evt2(word);
 		}
 
@@ -273,23 +311,29 @@ void task_evt_decoder(const args_evt_decoder_t *args) {
 //more usb streaming
 void task_usb_tx(void *argument)
 {
-    (void)argument;
+		(void)argument;
+		//trying two buffers, so that the one being transferred cant be altered
+	    static uint8_t buf0[512];
+	    static uint8_t buf1[512];
+	    uint8_t *fill = buf0; //pointer to current fill buffer
 
-    uint8_t chunk[512];
+	    for (;;) {
 
-    for (;;) {
+	        uint32_t n = usb_rb_pop_bytes(fill, sizeof(buf0)); //pop as many words as possible
+	        if (n == 0) { //if none are ready then wait
+	            osDelay(1);
+	            continue;
+	        }
 
-        uint32_t n = usb_rb_pop_bytes(chunk, sizeof(chunk));
+	        // start  USB transfer, if busy then wait
+	        while (CDC_Transmit_FS(fill, (uint16_t)n) == USBD_BUSY) {
+	            osDelay(1);
+	        }
 
-        if (n == 0) {
-            osDelay(1);
-            continue;
-        }
+	        // switch buffers for filling
+	        fill = (fill == buf0) ? buf1 : buf0;
+	    }
 
-        while (CDC_Transmit_FS(chunk, (uint16_t)n) == USBD_BUSY) {
-            osDelay(1);
-        }
-    }
 }
 //end usb streaming
 
